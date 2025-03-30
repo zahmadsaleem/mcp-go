@@ -191,7 +191,7 @@ func (s *StdioServer) Listen(
 	stdout io.Writer,
 ) error {
 	// Set a static client context since stdio only has one client
-	if err := s.server.RegisterSession(&stdioSessionInstance); err != nil {
+	if err := s.server.RegisterSession(ctx, &stdioSessionInstance); err != nil {
 		return fmt.Errorf("register session: %w", err)
 	}
 	defer s.server.UnregisterSession(stdioSessionInstance.SessionID())
