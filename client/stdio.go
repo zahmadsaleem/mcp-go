@@ -12,7 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/zahmadsaleem/mcp-go/mcp"
 )
 
 // StdioMCPClient implements the MCPClient interface using stdio communication.
@@ -304,7 +304,7 @@ func (c *StdioMCPClient) ListResources(
 	ctx context.Context,
 	request mcp.ListResourcesRequest,
 ) (*mcp.
-	ListResourcesResult, error) {
+ListResourcesResult, error) {
 	response, err := c.sendRequest(
 		ctx,
 		"resources/list",
@@ -326,7 +326,7 @@ func (c *StdioMCPClient) ListResourceTemplates(
 	ctx context.Context,
 	request mcp.ListResourceTemplatesRequest,
 ) (*mcp.
-	ListResourceTemplatesResult, error) {
+ListResourceTemplatesResult, error) {
 	response, err := c.sendRequest(
 		ctx,
 		"resources/templates/list",
