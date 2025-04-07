@@ -89,7 +89,9 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create request: %w", err)
 
 	}
-
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Connection", "keep-alive")
