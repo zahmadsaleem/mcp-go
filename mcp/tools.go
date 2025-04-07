@@ -104,9 +104,10 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 }
 
 type ToolInputSchema struct {
-	Type       string                 `json:"type"`
-	Properties map[string]interface{} `json:"properties"`
-	Required   []string               `json:"required,omitempty"`
+	Definitions map[string]interface{} `json:"$defs,omitempty"`
+	Type        string                 `json:"type"`
+	Properties  map[string]interface{} `json:"properties"`
+	Required    []string               `json:"required,omitempty"`
 }
 
 // ToolOption is a function that configures a Tool.
