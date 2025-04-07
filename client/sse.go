@@ -18,25 +18,38 @@ import (
 	"github.com/zahmadsaleem/mcp-go/mcp"
 )
 
+const (
+	defaultToolResponseSizeLimit = 1 * 1024 // 1 MB
+	defaultSSEReadTimeout        = 30 * time.Second
+	defaultResponseTimeout       = 30 * time.Second
+)
+
+var (
+	ErrResponseTimeout  = errors.New("mcpclient: response timed out")
+	ErrResponseTooLarge = errors.New("mcpclient: response too large")
+)
+
 // SSEMCPClient implements the MCPClient interface using Server-Sent Events (SSE).
 // It maintains a persistent HTTP connection to receive server-pushed events
 // while sending requests over regular HTTP POST calls. The client handles
 // automatic reconnection and message routing between requests and responses.
 type SSEMCPClient struct {
-	baseURL        *url.URL
-	endpoint       *url.URL
-	httpClient     *http.Client
-	requestID      atomic.Int64
-	responses      map[int64]chan RPCResponse
-	mu             sync.RWMutex
-	done           chan struct{}
-	initialized    bool
-	notifications  []func(mcp.JSONRPCNotification)
-	notifyMu       sync.RWMutex
-	endpointChan   chan struct{}
-	capabilities   mcp.ServerCapabilities
-	headers        map[string]string
-	sseReadTimeout time.Duration
+	baseURL               *url.URL
+	endpoint              *url.URL
+	httpClient            *http.Client
+	requestID             atomic.Int64
+	responses             map[int64]chan RPCResponse
+	mu                    sync.RWMutex
+	done                  chan struct{}
+	initialized           bool
+	notifications         []func(mcp.JSONRPCNotification)
+	notifyMu              sync.RWMutex
+	endpointChan          chan struct{}
+	capabilities          mcp.ServerCapabilities
+	headers               map[string]string
+	sseReadTimeout        time.Duration
+	toolResponseSizeLimit int
+	responseTimeout       time.Duration
 }
 
 type ClientOption func(*SSEMCPClient)
@@ -53,6 +66,18 @@ func WithSSEReadTimeout(timeout time.Duration) ClientOption {
 	}
 }
 
+func WithToolResponseSizeLimit(sizeLimit int) ClientOption {
+	return func(sc *SSEMCPClient) {
+		sc.toolResponseSizeLimit = sizeLimit
+	}
+}
+
+func WithResponseTimeout(timeout time.Duration) ClientOption {
+	return func(sc *SSEMCPClient) {
+		sc.responseTimeout = timeout
+	}
+}
+
 // NewSSEMCPClient creates a new SSE-based MCP client with the given base URL.
 // Returns an error if the URL is invalid.
 func NewSSEMCPClient(baseURL string, options ...ClientOption) (*SSEMCPClient, error) {
@@ -62,13 +87,15 @@ func NewSSEMCPClient(baseURL string, options ...ClientOption) (*SSEMCPClient, er
 	}
 
 	smc := &SSEMCPClient{
-		baseURL:        parsedURL,
-		httpClient:     &http.Client{},
-		responses:      make(map[int64]chan RPCResponse),
-		done:           make(chan struct{}),
-		endpointChan:   make(chan struct{}),
-		sseReadTimeout: 30 * time.Second,
-		headers:        make(map[string]string),
+		baseURL:               parsedURL,
+		httpClient:            &http.Client{},
+		responses:             make(map[int64]chan RPCResponse),
+		done:                  make(chan struct{}),
+		endpointChan:          make(chan struct{}),
+		sseReadTimeout:        defaultSSEReadTimeout,
+		headers:               make(map[string]string),
+		toolResponseSizeLimit: defaultToolResponseSizeLimit,
+		responseTimeout:       defaultResponseTimeout,
 	}
 
 	for _, opt := range options {
@@ -528,9 +555,21 @@ func (c *SSEMCPClient) CallTool(
 	ctx context.Context,
 	request mcp.CallToolRequest,
 ) (*mcp.CallToolResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.responseTimeout)
+	defer cancel()
+
 	response, err := c.sendRequest(ctx, "tools/call", request.Params)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w: %s", ErrResponseTimeout, err.Error())
+		}
 		return nil, err
+	}
+
+	if response != nil && len(*response) > c.toolResponseSizeLimit {
+		return nil, fmt.Errorf("%w: response size (%d bytes) exceeds the configured limit (%d bytes)",
+			ErrResponseTooLarge,
+			len(*response), c.toolResponseSizeLimit)
 	}
 
 	return mcp.ParseCallToolResult(response)
