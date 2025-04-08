@@ -240,8 +240,6 @@ func (c *SSEMCPClient) readSSE(ctx context.Context, reader io.ReadCloser) {
 			return
 		case <-sseCtx.Done():
 			return
-		default:
-			// continue with the read
 		}
 
 		// Remove only newline markers
