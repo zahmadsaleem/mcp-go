@@ -19,9 +19,20 @@ import (
 )
 
 const (
-	defaultToolResponseSizeLimit = 1 * 1024 // 1 MB
-	defaultSSEReadTimeout        = 30 * time.Second
+	defaultToolResponseSizeLimit = 1 * 1024         // 1 MB
+	defaultSSEReadTimeout        = 30 * time.Second // when the connection is inactive for this duration, the client will close the connection, the server might have gone away
 	defaultResponseTimeout       = 30 * time.Second
+	defaultSSEMaxLifetime        = 10 * time.Minute // entire duration of the mcp connection
+
+)
+
+type connectionState int
+
+const (
+	unInitialized connectionState = iota
+	started
+	initialized
+	closed
 )
 
 var (
@@ -50,6 +61,8 @@ type SSEMCPClient struct {
 	sseReadTimeout        time.Duration
 	toolResponseSizeLimit int
 	responseTimeout       time.Duration
+	maxSSELifetime        time.Duration
+	state                 atomic.Int32
 }
 
 type ClientOption func(*SSEMCPClient)
@@ -68,13 +81,28 @@ func WithSSEReadTimeout(timeout time.Duration) ClientOption {
 
 func WithToolResponseSizeLimit(sizeLimit int) ClientOption {
 	return func(sc *SSEMCPClient) {
+		if sizeLimit <= 0 {
+			sizeLimit = defaultToolResponseSizeLimit
+		}
 		sc.toolResponseSizeLimit = sizeLimit
 	}
 }
 
 func WithResponseTimeout(timeout time.Duration) ClientOption {
 	return func(sc *SSEMCPClient) {
+		if timeout <= 0 {
+			timeout = defaultResponseTimeout
+		}
 		sc.responseTimeout = timeout
+	}
+}
+
+func WithMaxSSELifetime(lifetime time.Duration) ClientOption {
+	return func(sc *SSEMCPClient) {
+		if lifetime <= 0 {
+			lifetime = defaultSSEMaxLifetime
+		}
+		sc.maxSSELifetime = lifetime
 	}
 }
 
@@ -108,6 +136,10 @@ func NewSSEMCPClient(baseURL string, options ...ClientOption) (*SSEMCPClient, er
 // Start initiates the SSE connection to the server and waits for the endpoint information.
 // Returns an error if the connection fails or times out waiting for the endpoint.
 func (c *SSEMCPClient) Start(ctx context.Context) error {
+	// since we can't reuse SSEMCPClient, make sure we don't start it twice
+	if !c.state.CompareAndSwap(int32(unInitialized), int32(started)) {
+		return fmt.Errorf("mcp: client already started")
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL.String(), nil)
 
@@ -133,7 +165,7 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	go c.readSSE(resp.Body)
+	go c.readSSE(ctx, resp.Body)
 
 	// Wait for the endpoint to be received
 
@@ -151,21 +183,31 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 
 // readSSE continuously reads the SSE stream and processes events.
 // It runs until the connection is closed or an error occurs.
-func (c *SSEMCPClient) readSSE(reader io.ReadCloser) {
+func (c *SSEMCPClient) readSSE(ctx context.Context, reader io.ReadCloser) {
 	defer reader.Close()
 
 	br := bufio.NewReader(reader)
 	var event, data string
 
-	ctx, cancel := context.WithTimeout(context.Background(), c.sseReadTimeout)
+	ctx, cancel := context.WithTimeout(ctx, c.maxSSELifetime)
 	defer cancel()
 
 	for {
+		readCtx, cancel2 := context.WithTimeout(ctx, c.sseReadTimeout)
+
 		select {
-		case <-ctx.Done():
+		case <-readCtx.Done():
+			// no messages received for a while, close the connection
+			// or parent context is done
+			cancel2() // redundant, but ensures we don't leak context
+			err := c.Close()
+			if err != nil {
+				fmt.Printf("Error closing SSE connection: %v\n", err)
+			}
 			return
 		default:
 			line, err := br.ReadString('\n')
+			cancel2()
 			if err != nil {
 				if err == io.EOF {
 					// Process any pending event before exit
@@ -176,9 +218,11 @@ func (c *SSEMCPClient) readSSE(reader io.ReadCloser) {
 				}
 				select {
 				case <-c.done:
+					cancel2()
 					return
 				default:
 					fmt.Printf("SSE stream error: %v\n", err)
+					cancel2()
 					return
 				}
 			}
@@ -192,6 +236,7 @@ func (c *SSEMCPClient) readSSE(reader io.ReadCloser) {
 					event = ""
 					data = ""
 				}
+				cancel2()
 				continue
 			}
 
@@ -201,6 +246,7 @@ func (c *SSEMCPClient) readSSE(reader io.ReadCloser) {
 				data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			}
 		}
+		cancel2()
 	}
 }
 
@@ -290,7 +336,12 @@ func (c *SSEMCPClient) sendRequest(
 	method string,
 	params interface{},
 ) (*json.RawMessage, error) {
-	if !c.initialized && method != "initialize" {
+	currentState := connectionState(c.state.Load())
+	if currentState == closed {
+		return nil, fmt.Errorf("mcp: client: closed")
+	}
+
+	if !c.initialized && method != "initialize" && currentState != initialized {
 		return nil, fmt.Errorf("client not initialized")
 	}
 
@@ -369,6 +420,11 @@ func (c *SSEMCPClient) Initialize(
 	ctx context.Context,
 	request mcp.InitializeRequest,
 ) (*mcp.InitializeResult, error) {
+	// ensure we are not already initialized
+	if !c.state.CompareAndSwap(int32(started), int32(initialized)) {
+		return nil, fmt.Errorf("mcp: client already initialized")
+	}
+
 	// Ensure we send a params object with all required fields
 	params := struct {
 		ProtocolVersion string                 `json:"protocolVersion"`
@@ -610,6 +666,11 @@ func (c *SSEMCPClient) GetEndpoint() *url.URL {
 // Close shuts down the SSE client connection and cleans up any pending responses.
 // Returns an error if the shutdown process fails.
 func (c *SSEMCPClient) Close() error {
+	if !c.state.CompareAndSwap(int32(started), int32(closed)) &&
+		!c.state.CompareAndSwap(int32(initialized), int32(closed)) {
+		return nil
+	}
+	
 	select {
 	case <-c.done:
 		return nil // Already closed
