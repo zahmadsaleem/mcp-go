@@ -141,12 +141,14 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 		return fmt.Errorf("mcp: client already started")
 	}
 
+	// context specifically for the endpoint wait that can be canceled
+	// if the SSE connection closes prematurely
+	endpointCtx, endpointCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer endpointCancel()
+
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL.String(), nil)
-
 	if err != nil {
-
 		return fmt.Errorf("failed to create request: %w", err)
-
 	}
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
@@ -165,20 +167,27 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	go c.readSSE(ctx, resp.Body)
+	// channel to signal if the SSE reader exits before getting endpoint
+	sseExited := make(chan struct{})
+	go func() {
+		c.readSSE(ctx, resp.Body)
+		close(sseExited)
+	}()
 
-	// Wait for the endpoint to be received
-
+	// wait for either endpoint or an error condition
 	select {
 	case <-c.endpointChan:
-		// Endpoint received, proceed
+		// endpoint received, proceed
+		return nil
+	case <-endpointCtx.Done():
+		return fmt.Errorf("timeout waiting for endpoint")
 	case <-ctx.Done():
 		return fmt.Errorf("context cancelled while waiting for endpoint")
-	case <-time.After(30 * time.Second): // Add a timeout
-		return fmt.Errorf("timeout waiting for endpoint")
+	case <-sseExited:
+		return fmt.Errorf("SSE connection closed before receiving endpoint")
+	case <-c.done:
+		return fmt.Errorf("client closed before receiving endpoint")
 	}
-
-	return nil
 }
 
 // readSSE continuously reads the SSE stream and processes events.
@@ -189,69 +198,80 @@ func (c *SSEMCPClient) readSSE(ctx context.Context, reader io.ReadCloser) {
 	br := bufio.NewReader(reader)
 	var event, data string
 
-	ctx, cancel := context.WithTimeout(ctx, c.maxSSELifetime)
-	defer cancel()
+	sseCtx, sseCancel := context.WithTimeout(ctx, c.maxSSELifetime)
+	defer sseCancel()
 
 	for {
-		readCtx, cancel2 := context.WithTimeout(ctx, c.sseReadTimeout)
-
+		// check if we should exit before trying to read
 		select {
-		case <-readCtx.Done():
-			// no messages received for a while, close the connection
-			// or parent context is done
-			cancel2() // redundant, but ensures we don't leak context
-			err := c.Close()
-			if err != nil {
-				fmt.Printf("Error closing SSE connection: %v\n", err)
-			}
+		case <-sseCtx.Done():
+			c.Close()
+			return
+		case <-c.done:
 			return
 		default:
-			line, err := br.ReadString('\n')
-			cancel2()
-			if err != nil {
-				if err == io.EOF {
-					// Process any pending event before exit
+			// continue with the read
+		}
+
+		readTimer := time.NewTimer(c.sseReadTimeout)
+		readDone := make(chan struct{})
+
+		// read in a separate goroutine to handle timeouts properly
+		var line string
+		var readErr error
+
+		go func() {
+			line, readErr = br.ReadString('\n')
+			close(readDone)
+		}()
+
+		// wait for read to complete or timeout
+		select {
+		case <-readDone:
+			readTimer.Stop()
+			if readErr != nil {
+				if readErr == io.EOF {
+					// process any pending event before exit
 					if event != "" && data != "" {
 						c.handleSSEEvent(event, data)
 					}
-					break
-				}
-				select {
-				case <-c.done:
-					cancel2()
-					return
-				default:
-					fmt.Printf("SSE stream error: %v\n", err)
-					cancel2()
 					return
 				}
+				fmt.Printf("SSE stream error: %v\n", readErr)
+				return
 			}
-
-			// Remove only newline markers
-			line = strings.TrimRight(line, "\r\n")
-			if line == "" {
-				// Empty line means end of event
-				if event != "" && data != "" {
-					c.handleSSEEvent(event, data)
-					event = ""
-					data = ""
-				}
-				cancel2()
-				continue
-			}
-
-			if strings.HasPrefix(line, "event:") {
-				event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			} else if strings.HasPrefix(line, "data:") {
-				data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			}
+		case <-readTimer.C:
+			// read operation timed out
+			c.Close()
+			return
+		case <-sseCtx.Done():
+			return
+		case <-c.done:
+			// client closed
+			return
 		}
-		cancel2()
+
+		// Remove only newline markers
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			// Empty line means end of event
+			if event != "" && data != "" {
+				c.handleSSEEvent(event, data)
+				event = ""
+				data = ""
+			}
+			continue
+		}
+
+		if strings.HasPrefix(line, "event:") {
+			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		}
 	}
 }
 
 // handleSSEEvent processes SSE events based on their type.
-// Handles 'endpoint' events for connection setup and 'message' events for JSON-RPC communication.
 func (c *SSEMCPClient) handleSSEEvent(event, data string) {
 	switch event {
 	case "endpoint":
@@ -264,8 +284,19 @@ func (c *SSEMCPClient) handleSSEEvent(event, data string) {
 			fmt.Printf("Endpoint origin does not match connection origin\n")
 			return
 		}
-		c.endpoint = endpoint
-		close(c.endpointChan)
+
+		// Only set the endpoint and signal if it hasn't been done yet
+		c.mu.Lock()
+		if c.endpoint == nil {
+			c.endpoint = endpoint
+			select {
+			case <-c.endpointChan:
+				// Already closed, do nothing
+			default:
+				close(c.endpointChan)
+			}
+		}
+		c.mu.Unlock()
 
 	case "message":
 		var baseMessage struct {
@@ -670,7 +701,7 @@ func (c *SSEMCPClient) Close() error {
 		!c.state.CompareAndSwap(int32(initialized), int32(closed)) {
 		return nil
 	}
-	
+
 	select {
 	case <-c.done:
 		return nil // Already closed
