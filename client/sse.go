@@ -51,7 +51,6 @@ type SSEMCPClient struct {
 	requestID             atomic.Int64
 	responses             map[int64]chan RPCResponse
 	mu                    sync.RWMutex
-	done                  chan struct{}
 	initialized           bool
 	notifications         []func(mcp.JSONRPCNotification)
 	notifyMu              sync.RWMutex
@@ -118,7 +117,6 @@ func NewSSEMCPClient(baseURL string, options ...ClientOption) (*SSEMCPClient, er
 		baseURL:               parsedURL,
 		httpClient:            &http.Client{},
 		responses:             make(map[int64]chan RPCResponse),
-		done:                  make(chan struct{}),
 		endpointChan:          make(chan struct{}),
 		sseReadTimeout:        defaultSSEReadTimeout,
 		headers:               make(map[string]string),
@@ -185,8 +183,6 @@ func (c *SSEMCPClient) Start(ctx context.Context) error {
 		return fmt.Errorf("context cancelled while waiting for endpoint")
 	case <-sseExited:
 		return fmt.Errorf("SSE connection closed before receiving endpoint")
-	case <-c.done:
-		return fmt.Errorf("client closed before receiving endpoint")
 	}
 }
 
@@ -206,8 +202,6 @@ func (c *SSEMCPClient) readSSE(ctx context.Context, reader io.ReadCloser) {
 		select {
 		case <-sseCtx.Done():
 			c.Close()
-			return
-		case <-c.done:
 			return
 		default:
 			// continue with the read
@@ -246,9 +240,8 @@ func (c *SSEMCPClient) readSSE(ctx context.Context, reader io.ReadCloser) {
 			return
 		case <-sseCtx.Done():
 			return
-		case <-c.done:
-			// client closed
-			return
+		default:
+			// continue with the read
 		}
 
 		// Remove only newline markers
@@ -700,13 +693,6 @@ func (c *SSEMCPClient) Close() error {
 	if !c.state.CompareAndSwap(int32(started), int32(closed)) &&
 		!c.state.CompareAndSwap(int32(initialized), int32(closed)) {
 		return nil
-	}
-
-	select {
-	case <-c.done:
-		return nil // Already closed
-	default:
-		close(c.done)
 	}
 
 	// Clean up any pending responses
