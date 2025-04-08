@@ -122,6 +122,7 @@ func NewSSEMCPClient(baseURL string, options ...ClientOption) (*SSEMCPClient, er
 		headers:               make(map[string]string),
 		toolResponseSizeLimit: defaultToolResponseSizeLimit,
 		responseTimeout:       defaultResponseTimeout,
+		maxSSELifetime:        defaultSSEMaxLifetime,
 	}
 
 	for _, opt := range options {
