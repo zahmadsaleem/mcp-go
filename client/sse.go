@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	defaultToolResponseSizeLimit = 1 * 1024         // 1 MB
+	defaultToolResponseSizeLimit = 1024 * 1024      // 1 MB
 	defaultSSEReadTimeout        = 30 * time.Second // when the connection is inactive for this duration, the client will close the connection, the server might have gone away
 	defaultResponseTimeout       = 30 * time.Second
 	defaultSSEMaxLifetime        = 10 * time.Minute // entire duration of the mcp connection
