@@ -60,6 +60,7 @@ type SSEServer struct {
 	sessions        sync.Map
 	srv             *http.Server
 	contextFunc     SSEContextFunc
+	msgEndpointFunc func(sessionID string) string
 }
 
 // SSEOption defines a function type for configuring SSEServer
@@ -125,6 +126,12 @@ func WithHTTPServer(srv *http.Server) SSEOption {
 func WithSSEContextFunc(fn SSEContextFunc) SSEOption {
 	return func(s *SSEServer) {
 		s.contextFunc = fn
+	}
+}
+
+func WithMessageEndpointFunc(fn func(sessionID string) string) SSEOption {
+	return func(s *SSEServer) {
+		s.msgEndpointFunc = fn
 	}
 }
 
@@ -245,6 +252,9 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	messageEndpoint := fmt.Sprintf("%s?sessionId=%s", s.CompleteMessageEndpoint(), sessionID)
+	if s.msgEndpointFunc != nil {
+		messageEndpoint = s.msgEndpointFunc(sessionID)
+	}
 
 	// Send the initial endpoint event
 	fmt.Fprintf(w, "event: endpoint\ndata: %s\r\n\r\n", messageEndpoint)
